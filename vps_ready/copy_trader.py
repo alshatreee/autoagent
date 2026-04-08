@@ -58,6 +58,11 @@ STATE_FILE      = os.getenv("STATE_FILE", "copy_trader_state.json")
 
 CHAIN_ID_POLYGON = 137
 
+# Per-bot wallet (with fallback to shared POLY_* for backwards compat)
+PRIVATE_KEY = os.getenv("ARB1_PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY", "")
+FUNDER      = os.getenv("ARB1_FUNDER")      or os.getenv("POLY_FUNDER", "")
+SIG_TYPE    = int(os.getenv("ARB1_SIG_TYPE") or os.getenv("POLY_SIG_TYPE", "0"))
+
 # ═══════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════
@@ -241,10 +246,10 @@ async def copy_trade(session, target_pos: dict, state: State, paper: bool) -> bo
     try:
         client = ClobClient(
             host     = CLOB_HOST,
-            key      = os.getenv("POLY_PRIVATE_KEY", ""),
+            key      = PRIVATE_KEY,
             chain_id = CHAIN_ID_POLYGON,
-            funder   = os.getenv("POLY_FUNDER", ""),
-            signature_type = int(os.getenv("POLY_SIG_TYPE", "0")),
+            funder   = FUNDER,
+            signature_type = SIG_TYPE,
         )
         client.set_api_creds(client.create_or_derive_api_creds())
 
@@ -310,10 +315,10 @@ def preflight(paper: bool) -> bool:
     if paper:
         return True
     problems = []
-    if not os.getenv("POLY_PRIVATE_KEY", "").startswith("0x"):
-        problems.append("POLY_PRIVATE_KEY missing")
-    if not os.getenv("POLY_FUNDER", "").startswith("0x"):
-        problems.append("POLY_FUNDER missing")
+    if not PRIVATE_KEY.startswith("0x"):
+        problems.append("ARB1_PRIVATE_KEY (or POLY_PRIVATE_KEY) missing")
+    if not FUNDER.startswith("0x") or len(FUNDER) != 42:
+        problems.append(f"ARB1_FUNDER invalid: {FUNDER}")
     if not TARGET_WALLET.startswith("0x") or len(TARGET_WALLET) != 42:
         problems.append(f"TARGET_WALLET invalid: {TARGET_WALLET}")
     if problems:
@@ -321,6 +326,7 @@ def preflight(paper: bool) -> bool:
         for p in problems:
             print(f"  - {p}")
         return False
+    print(f"[PREFLIGHT OK] arb1 funder={FUNDER}")
     return True
 
 

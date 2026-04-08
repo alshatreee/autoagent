@@ -71,6 +71,11 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID_POLYGON = 137
 
+# Per-bot wallet (with fallback to shared POLY_* for backwards compat)
+PRIVATE_KEY = os.getenv("ARB2_PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY", "")
+FUNDER      = os.getenv("ARB2_FUNDER")      or os.getenv("POLY_FUNDER", "")
+SIG_TYPE    = int(os.getenv("ARB2_SIG_TYPE") or os.getenv("POLY_SIG_TYPE", "0"))
+
 # ═══════════════════════════════════════════════════════
 # MARKETS — configure the price-target markets you want to arbitrage
 # ═══════════════════════════════════════════════════════
@@ -320,10 +325,10 @@ async def check_market(session, market: dict, state: State, paper: bool):
     try:
         client = ClobClient(
             host     = CLOB_HOST,
-            key      = os.getenv("POLY_PRIVATE_KEY", ""),
+            key      = PRIVATE_KEY,
             chain_id = CHAIN_ID_POLYGON,
-            funder   = os.getenv("POLY_FUNDER", ""),
-            signature_type = int(os.getenv("POLY_SIG_TYPE", "0")),
+            funder   = FUNDER,
+            signature_type = SIG_TYPE,
         )
         client.set_api_creds(client.create_or_derive_api_creds())
         order = client.create_order(OrderArgs(
@@ -376,12 +381,13 @@ def preflight(paper: bool) -> bool:
         return False
     if paper:
         return True
-    if not os.getenv("POLY_PRIVATE_KEY", "").startswith("0x"):
-        print("[PREFLIGHT] POLY_PRIVATE_KEY missing")
+    if not PRIVATE_KEY.startswith("0x"):
+        print("[PREFLIGHT] ARB2_PRIVATE_KEY (or POLY_PRIVATE_KEY) missing")
         return False
-    if not os.getenv("POLY_FUNDER", "").startswith("0x"):
-        print("[PREFLIGHT] POLY_FUNDER missing")
+    if not FUNDER.startswith("0x") or len(FUNDER) != 42:
+        print(f"[PREFLIGHT] ARB2_FUNDER invalid: {FUNDER}")
         return False
+    print(f"[PREFLIGHT OK] arb2 funder={FUNDER}")
     return True
 
 

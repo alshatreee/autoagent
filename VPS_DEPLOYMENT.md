@@ -94,17 +94,51 @@ nano /root/bots/.env
 chmod 600 /root/bots/.env
 ```
 
-Required values:
+### Per-bot wallet mapping
+
+Each bot has its own funded wallet so a single drained/flagged wallet
+doesn't take down the others:
+
+| Bot | Funder address | Env vars |
+|---|---|---|
+| arb1 | `0x01e5F00409044be6072A7a7f9fB7DeAF246A34ec` | `ARB1_FUNDER`, `ARB1_PRIVATE_KEY`, `ARB1_SIG_TYPE` |
+| arb2 | `0x17C77b3B5ad4EdCf5E7E0731a46a69B114E00923` | `ARB2_FUNDER`, `ARB2_PRIVATE_KEY`, `ARB2_SIG_TYPE` |
+| arb3 | `0xdBefe89Bfb5Cf18c54Aa50520D3a26bf0c1D1857` | `ARB3_FUNDER`, `ARB3_PRIVATE_KEY`, `ARB3_SIG_TYPE` |
+
+The `FUNDER` addresses are pre-filled in `.env.template`. You only
+need to add the matching `PRIVATE_KEY` for each — paste them ONCE on
+the VPS, never via chat or screenshots.
+
+### Other required values
 
 | Variable | How to get it |
 |---|---|
-| `POLY_PRIVATE_KEY` | Your wallet's private key (LIVE only — leave blank for paper) |
-| `POLY_FUNDER` | Same as wallet address for EOA, or proxy address |
-| `POLY_SIG_TYPE` | `0` for EOA wallets (your case based on the audit) |
-| `TARGET_WALLET` | sharky6999's full address |
+| `TARGET_WALLET` | sharky6999's full 42-char address (for arb1) |
 | `ALCHEMY_WSS` | Free key from https://dashboard.alchemy.com/ |
 | `TELEGRAM_BOT_TOKEN` | `/newbot` to @BotFather on Telegram |
 | `TELEGRAM_CHAT_ID` | Message @userinfobot on Telegram |
+
+### Verifying each wallet is correctly configured
+
+For each bot, verify the private key matches its funder address:
+
+```bash
+set -a; . /root/bots/.env; set +a
+python3 - <<'EOF'
+import os
+from eth_account import Account
+for bot in ("ARB1", "ARB2", "ARB3"):
+    pk = os.getenv(f"{bot}_PRIVATE_KEY", "")
+    fn = os.getenv(f"{bot}_FUNDER", "")
+    if not pk:
+        print(f"{bot}: no key set"); continue
+    derived = Account.from_key(pk).address
+    match = "MATCH" if derived.lower() == fn.lower() else "MISMATCH"
+    print(f"{bot}: derived={derived} funder={fn} {match}")
+EOF
+```
+
+All three should print `MATCH` before going live.
 
 Test telegram:
 

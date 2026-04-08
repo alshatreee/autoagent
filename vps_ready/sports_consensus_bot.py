@@ -43,6 +43,11 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID_POLYGON = 137
 
+# Per-bot wallet (with fallback to shared POLY_* for backwards compat)
+PRIVATE_KEY = os.getenv("ARB3_PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY", "")
+FUNDER      = os.getenv("ARB3_FUNDER")      or os.getenv("POLY_FUNDER", "")
+SIG_TYPE    = int(os.getenv("ARB3_SIG_TYPE") or os.getenv("POLY_SIG_TYPE", "0"))
+
 SMART_WALLETS_FILE = os.getenv("SMART_WALLETS_FILE", "smart_wallets.json")
 STATE_FILE         = os.getenv("STATE_FILE", "sports_state.json")
 
@@ -302,40 +307,35 @@ def find_consensus(state: State) -> list[tuple[str, str, int]]:
 # ENTRY
 # ═══════════════════════════════════════════════════════
 
-async def place_order(token_id: str, price: float, shares: float) -> Optional[dict]:
+def _make_client():
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
-
     client = ClobClient(
         host     = CLOB_HOST,
-        key      = os.getenv("POLY_PRIVATE_KEY", ""),
+        key      = PRIVATE_KEY,
         chain_id = CHAIN_ID_POLYGON,
-        funder   = os.getenv("POLY_FUNDER", ""),
-        signature_type = int(os.getenv("POLY_SIG_TYPE", "0")),
+        funder   = FUNDER,
+        signature_type = SIG_TYPE,
     )
     client.set_api_creds(client.create_or_derive_api_creds())
+    return client
 
-    side = BUY  # entry is always BUY; sells are handled separately
+
+async def place_order(token_id: str, price: float, shares: float) -> Optional[dict]:
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+
+    client = _make_client()
     order = client.create_order(OrderArgs(
-        token_id=token_id, price=price, size=shares, side=side,
+        token_id=token_id, price=price, size=shares, side=BUY,
     ))
     return client.post_order(order, OrderType.GTC)
 
 
 async def sell_order(token_id: str, price: float, shares: float) -> Optional[dict]:
-    from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import SELL
 
-    client = ClobClient(
-        host     = CLOB_HOST,
-        key      = os.getenv("POLY_PRIVATE_KEY", ""),
-        chain_id = CHAIN_ID_POLYGON,
-        funder   = os.getenv("POLY_FUNDER", ""),
-        signature_type = int(os.getenv("POLY_SIG_TYPE", "0")),
-    )
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client = _make_client()
     order = client.create_order(OrderArgs(
         token_id=token_id, price=price, size=shares, side=SELL,
     ))
@@ -524,12 +524,13 @@ def preflight(paper: bool) -> bool:
         return False
     if paper:
         return True
-    if not os.getenv("POLY_PRIVATE_KEY", "").startswith("0x"):
-        print("[PREFLIGHT] POLY_PRIVATE_KEY missing")
+    if not PRIVATE_KEY.startswith("0x"):
+        print("[PREFLIGHT] ARB3_PRIVATE_KEY (or POLY_PRIVATE_KEY) missing")
         return False
-    if not os.getenv("POLY_FUNDER", "").startswith("0x"):
-        print("[PREFLIGHT] POLY_FUNDER missing")
+    if not FUNDER.startswith("0x") or len(FUNDER) != 42:
+        print(f"[PREFLIGHT] ARB3_FUNDER invalid: {FUNDER}")
         return False
+    print(f"[PREFLIGHT OK] arb3 funder={FUNDER}")
     return True
 
 
