@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket arb3 — Sports Consensus Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bots
+EnvironmentFile=/root/bots/.env
+ExecStart=/usr/bin/python3 /root/bots/sports_consensus_bot.py --paper
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:/root/bots/logs/arb3.log
+StandardError=append:/root/bots/logs/arb3.log
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/bots
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
