@@ -75,46 +75,65 @@ LOG_FILE    = os.getenv("SIGNAL_LOG", "signal_log.jsonl")
 
 MONITOR_INTERVAL = 10   # seconds between TP/SL checks
 MIN_VOLUME_24H   = 50_000  # skip coins with < $50K 24h volume
-DEFAULT_SL_PCT   = 0.10    # if signal has no SL, use -10% from entry
 MIN_SELL_USDT    = 11.0    # Binance min notional ~$10; use $11 for safety
 
+# Timeframe-based auto TP/SL (since Naif_Alert signals have no TP/SL)
+TIMEFRAME_PARAMS = {
+    "15m": {"tp_pct": 0.02, "sl_pct": 0.01, "hold_h": 2},
+    "1h":  {"tp_pct": 0.03, "sl_pct": 0.015, "hold_h": 6},
+    "4h":  {"tp_pct": 0.05, "sl_pct": 0.025, "hold_h": 24},
+    "1d":  {"tp_pct": 0.08, "sl_pct": 0.04, "hold_h": 72},
+}
+DEFAULT_TF_PARAMS = {"tp_pct": 0.03, "sl_pct": 0.015, "hold_h": 6}
+
+# Trend strength filter — only trade strong signals
+# 🔥 قوي جداً = always, 💪 قوي = if volume > 50%, ⚖️ متوسط = if volume > 100%
+MIN_TREND_STRENGTH = 60     # minimum trend % to consider at all
+MIN_VOLUME_STRENGTH = 30.0  # minimum volume strength %
+
 # ═══════════════════════════════════════════════════════
-# SIGNAL PARSER
+# SIGNAL PARSER — tuned for Naif_Alert format
 # ═══════════════════════════════════════════════════════
 
 @dataclass
 class Signal:
-    coin:     str         # e.g. "BTC"
-    pair:     str         # e.g. "BTC/USDT"
-    side:     str         # "BUY" (for spot, always buy)
-    entry:    float       # entry price (0 = market)
-    targets:  list[float] # TP1, TP2, ...
-    stop:     float       # SL price
-    raw_text: str = ""
+    coin:           str            # e.g. "FET"
+    pair:           str            # e.g. "FET/USDT"
+    side:           str            # "BUY" only (skip SELL for spot)
+    entry:          float          # entry price
+    targets:        list[float]    # auto-calculated TP
+    stop:           float          # auto-calculated SL
+    timeframe:      str = "15m"
+    trend_strength: float = 0.0    # 0-100
+    volume_strength: float = 0.0   # percentage
+    max_hold_hours: int = 6
+    raw_text:       str = ""
 
 
-# Common signal patterns (Arabic + English)
-_COIN_RE = re.compile(
-    r'(?:عملة|زوج|coin|pair|symbol)[:\s]*'
-    r'[#$]?([A-Z0-9]{2,10})(?:/USDT)?',
-    re.IGNORECASE
-)
-_COIN_HASH_RE = re.compile(r'[#$]([A-Z]{2,10})', re.IGNORECASE)
-_COIN_USDT_RE = re.compile(r'\b([A-Z]{2,10})[\s/]?USDT\b', re.IGNORECASE)
+# ─── Regex patterns for Naif_Alert ───
+# Direction: 🟢 BUY or LONG / 🔴 SELL or SHORT
+_DIRECTION_RE = re.compile(r'(BUY|LONG|SELL|SHORT)', re.IGNORECASE)
 
-_ENTRY_RE = re.compile(
-    r'(?:دخول|entry|شراء|buy|سعر)[:\s]*(\d+[\.,]?\d*)',
-    re.IGNORECASE
+# Coin: from TradingView link BINANCE:XXXUSDT or العملة: XXXUSDT
+_TV_COIN_RE = re.compile(r'BINANCE[:\s]+([A-Z0-9]{2,10})USDT', re.IGNORECASE)
+_COIN_LABEL_RE = re.compile(
+    r'(?:العملة|عملة)[:\s]*([A-Z0-9]{2,10})USDT', re.IGNORECASE
 )
-_TP_RE = re.compile(
-    r'(?:هدف|target|tp|الهدف|take[\s]?profit)[:\s#\d]*[\s:]*(\d+[\.,]?\d*)',
-    re.IGNORECASE
+_COIN_USDT_RE = re.compile(r'\b([A-Z]{2,10})USDT\b', re.IGNORECASE)
+
+# Price: 💵 السعر: 0.235
+_PRICE_RE = re.compile(
+    r'(?:السعر|سعر|price)[:\s]*(\d+[\.,]?\d*)', re.IGNORECASE
 )
-_SL_RE = re.compile(
-    r'(?:وقف|stop|sl|ستوب|وقف[\s]?الخسارة|stop[\s]?loss)[:\s]*(\d+[\.,]?\d*)',
-    re.IGNORECASE
-)
-_ALL_NUMBERS = re.compile(r'(\d+[\.,]\d+)')
+
+# Timeframe: ⏱️ الفريم: 15m
+_TF_RE = re.compile(r'(?:الفريم|فريم|frame)[:\s]*(\d+[mhd])', re.IGNORECASE)
+
+# Volume strength: قوة الحجم: 56.4%
+_VOL_STR_RE = re.compile(r'قوة الحجم[:\s]*(\d+[\.,]?\d*)%')
+
+# Trend strength: قوة الاتجاه: 59%
+_TREND_STR_RE = re.compile(r'قوة الاتجاه[:\s]*(\d+[\.,]?\d*)%')
 
 
 def _parse_num(s: str) -> float:
@@ -122,65 +141,82 @@ def _parse_num(s: str) -> float:
 
 
 def parse_signal(text: str) -> Optional[Signal]:
-    """Best-effort signal extraction from a Telegram message."""
-    if not text or len(text) < 15:
+    """Parse Naif_Alert signal format."""
+    if not text or len(text) < 30:
         return None
 
-    # Step 1: detect coin
+    # ─── 1. Direction (skip SELL/SHORT — spot only) ───
+    dir_match = _DIRECTION_RE.search(text)
+    if not dir_match:
+        return None
+    direction = dir_match.group(1).upper()
+    if direction in ("SELL", "SHORT"):
+        return None  # spot only — can't short
+
+    # ─── 2. Coin ───
     coin = None
-    for pat in [_COIN_RE, _COIN_USDT_RE, _COIN_HASH_RE]:
+    for pat in [_TV_COIN_RE, _COIN_LABEL_RE, _COIN_USDT_RE]:
         m = pat.search(text)
         if m:
             coin = m.group(1).upper()
             break
     if not coin:
         return None
-
-    # Filter out common non-coins
-    if coin in ("USDT", "USD", "BUSD", "USDC", "THE", "AND", "FOR", "NOT"):
+    if coin in ("USDT", "USD", "BUSD", "USDC"):
         return None
-
     pair = f"{coin}/USDT"
 
-    # Step 2: extract entry price
+    # ─── 3. Entry price ───
     entry = 0.0
-    m = _ENTRY_RE.search(text)
+    m = _PRICE_RE.search(text)
     if m:
         entry = _parse_num(m.group(1))
+    if entry <= 0:
+        return None
 
-    # Step 3: extract all TP targets
-    targets = []
-    for m in _TP_RE.finditer(text):
-        try:
-            targets.append(_parse_num(m.group(1)))
-        except ValueError:
-            pass
-    targets = sorted(set(targets))
-
-    # Step 4: extract SL
-    stop = 0.0
-    m = _SL_RE.search(text)
+    # ─── 4. Timeframe ───
+    timeframe = "15m"
+    m = _TF_RE.search(text)
     if m:
-        stop = _parse_num(m.group(1))
+        timeframe = m.group(1).lower()
 
-    # Sanity: need at least a coin + (entry or targets or SL)
-    if not targets and stop == 0 and entry == 0:
+    # ─── 5. Volume strength ───
+    vol_str = 0.0
+    m = _VOL_STR_RE.search(text)
+    if m:
+        vol_str = _parse_num(m.group(1))
+
+    # ─── 6. Trend strength ───
+    trend_str = 0.0
+    m = _TREND_STR_RE.search(text)
+    if m:
+        trend_str = _parse_num(m.group(1))
+
+    # ─── 7. Quality filter (based on channel guide) ───
+    # ضعيف ⚠️ (<60%) = always skip
+    if trend_str < MIN_TREND_STRENGTH:
         return None
-
-    # Sanity: if entry > 0, SL should be below entry for a BUY
-    if entry > 0 and stop > 0 and stop >= entry:
-        # Might be a SELL signal — we only do spot BUY, skip
+    # متوسط ⚖️ (60-69%) = only if volume is very strong (>100%)
+    if trend_str < 70 and vol_str < 100:
         return None
+    # قوي 💪 (70-89%) = trade if volume decent (>50%)
+    if 70 <= trend_str < 90 and vol_str < 50:
+        return None
+    # قوي جداً 🔥 (90%+) = always trade
 
-    # Sanity: TP should be above entry
-    if entry > 0 and targets:
-        targets = [t for t in targets if t > entry]
-        if not targets:
-            return None
+    # ─── 8. Auto TP/SL based on timeframe ───
+    params = TIMEFRAME_PARAMS.get(timeframe, DEFAULT_TF_PARAMS)
+    tp = round(entry * (1 + params["tp_pct"]), 8)
+    sl = round(entry * (1 - params["sl_pct"]), 8)
+    hold_h = params["hold_h"]
 
     return Signal(
         coin=coin, pair=pair, side="BUY",
-        entry=entry, targets=targets, stop=stop,
+        entry=entry, targets=[tp], stop=sl,
+        timeframe=timeframe,
+        trend_strength=trend_str,
+        volume_strength=vol_str,
+        max_hold_hours=hold_h,
         raw_text=text[:500],
     )
 
@@ -279,16 +315,17 @@ async def market_sell(exchange, pair: str, coin_amount: float) -> Optional[dict]
 
 @dataclass
 class OpenPosition:
-    pair:       str
-    coin:       str
-    exchange:   str
-    amount:     float     # coin quantity
-    entry:      float     # price
-    cost:       float     # USDT spent
-    targets:    list[float]
-    stop:       float
-    opened_at:  float
-    targets_hit: int = 0
+    pair:           str
+    coin:           str
+    exchange:       str
+    amount:         float     # coin quantity
+    entry:          float     # price
+    cost:           float     # USDT spent
+    targets:        list[float]
+    stop:           float
+    opened_at:      float
+    targets_hit:    int = 0
+    max_hold_hours: int = 6
 
 
 @dataclass
@@ -321,6 +358,7 @@ class State:
                             "targets": v.targets, "stop": v.stop,
                             "opened_at": v.opened_at,
                             "targets_hit": v.targets_hit,
+                            "max_hold_hours": v.max_hold_hours,
                         }
                         for k, v in self.positions.items()
                     },
@@ -433,18 +471,16 @@ async def handle_signal(signal: Signal, exchanges: dict,
             log_signal(signal, f"skip:price_dev_{dev:.1%}")
             return
 
-    # Apply default SL if signal has none — protects against unlimited downside
-    effective_stop = signal.stop
-    if effective_stop <= 0 and price > 0:
-        effective_stop = round(price * (1 - DEFAULT_SL_PCT), 8)
-        print(f"[risk] no SL in signal, using default -{DEFAULT_SL_PCT:.0%} = {effective_stop}")
+    # SL is always set by parser (auto-calculated from timeframe)
+    effective_stop = signal.stop if signal.stop > 0 else round(price * 0.985, 8)
 
     coin_amount = round(TRADE_USDT / price, 8)
 
     tag = "PAPER" if paper else "LIVE"
     msg = (f"[{tag}] BUY {signal.pair} on {chosen_ex_name}\n"
-           f"price=${price} amount={coin_amount}\n"
-           f"TP={signal.targets} SL={signal.stop}")
+           f"price=${price} tf={signal.timeframe} "
+           f"trend={signal.trend_strength:.0f}% vol={signal.volume_strength:.0f}%\n"
+           f"TP={signal.targets} SL={effective_stop} hold={signal.max_hold_hours}h")
     print(msg)
     notify(msg, tag="signal")
 
@@ -455,6 +491,7 @@ async def handle_signal(signal: Signal, exchanges: dict,
             amount=coin_amount, entry=price,
             cost=TRADE_USDT, targets=signal.targets,
             stop=effective_stop, opened_at=time.time(),
+            max_hold_hours=signal.max_hold_hours,
         )
         state.trades += 1
         log_signal(signal, "paper_buy", {"price": price})
@@ -477,6 +514,7 @@ async def handle_signal(signal: Signal, exchanges: dict,
         amount=fill_amount, entry=fill_price,
         cost=TRADE_USDT, targets=signal.targets,
         stop=effective_stop, opened_at=time.time(),
+        max_hold_hours=signal.max_hold_hours,
     )
     state.trades += 1
     log_signal(signal, "live_buy", {
@@ -533,8 +571,9 @@ async def monitor_positions(exchanges: dict, state: State, paper: bool):
         if pos.stop > 0 and cur <= pos.stop:
             to_close.append((pair, f"SL @{cur:.6g}", cur))
 
-        # Time stop — 24h max hold
-        if time.time() - pos.opened_at > 24 * 3600:
+        # Time stop — per-signal hold duration based on timeframe
+        max_hold = pos.max_hold_hours * 3600
+        if time.time() - pos.opened_at > max_hold:
             to_close.append((pair, f"TIME_24H @{cur:.6g}", cur))
 
     for pair, reason, exit_price in to_close:
@@ -706,8 +745,9 @@ async def main(paper: bool, login_only: bool = False):
         if not signal:
             return  # not a signal message
 
-        print(f"\n[SIGNAL] {signal.pair} entry={signal.entry} "
-              f"TP={signal.targets} SL={signal.stop}")
+        print(f"\n[SIGNAL] {signal.pair} @{signal.entry} "
+              f"tf={signal.timeframe} trend={signal.trend_strength:.0f}% "
+              f"vol={signal.volume_strength:.0f}%")
 
         state.maybe_reset()
         await handle_signal(signal, exchanges, state, paper)
