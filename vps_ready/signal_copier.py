@@ -75,6 +75,8 @@ LOG_FILE    = os.getenv("SIGNAL_LOG", "signal_log.jsonl")
 
 MONITOR_INTERVAL = 10   # seconds between TP/SL checks
 MIN_VOLUME_24H   = 50_000  # skip coins with < $50K 24h volume
+DEFAULT_SL_PCT   = 0.10    # if signal has no SL, use -10% from entry
+MIN_SELL_USDT    = 11.0    # Binance min notional ~$10; use $11 for safety
 
 # ═══════════════════════════════════════════════════════
 # SIGNAL PARSER
@@ -202,18 +204,29 @@ def _create_exchange(name: str, paper: bool):
     else:
         raise ValueError(f"unknown exchange: {name}")
 
-    if paper:
-        ex.set_sandbox_mode(True)
+    # NOTE: do NOT set sandbox mode even for paper. Paper mode uses real
+    # market data (prices, pairs, volume) but skips order execution.
+    # Sandbox has different pairs/prices which makes paper results useless.
 
     return ex
 
 
-async def check_pair_exists(exchange, pair: str) -> bool:
+async def ensure_markets_loaded(exchange) -> bool:
+    """Load markets once (ccxt caches internally after first call)."""
+    if exchange.markets:
+        return True
     try:
         await asyncio.to_thread(exchange.load_markets)
-        return pair in exchange.markets
-    except Exception:
+        return True
+    except Exception as e:
+        print(f"[exchange] load_markets failed: {e}")
         return False
+
+
+async def check_pair_exists(exchange, pair: str) -> bool:
+    if not await ensure_markets_loaded(exchange):
+        return False
+    return pair in exchange.markets
 
 
 async def check_volume(exchange, pair: str) -> float:
@@ -420,6 +433,12 @@ async def handle_signal(signal: Signal, exchanges: dict,
             log_signal(signal, f"skip:price_dev_{dev:.1%}")
             return
 
+    # Apply default SL if signal has none — protects against unlimited downside
+    effective_stop = signal.stop
+    if effective_stop <= 0 and price > 0:
+        effective_stop = round(price * (1 - DEFAULT_SL_PCT), 8)
+        print(f"[risk] no SL in signal, using default -{DEFAULT_SL_PCT:.0%} = {effective_stop}")
+
     coin_amount = round(TRADE_USDT / price, 8)
 
     tag = "PAPER" if paper else "LIVE"
@@ -435,7 +454,7 @@ async def handle_signal(signal: Signal, exchanges: dict,
             exchange=chosen_ex_name,
             amount=coin_amount, entry=price,
             cost=TRADE_USDT, targets=signal.targets,
-            stop=signal.stop, opened_at=time.time(),
+            stop=effective_stop, opened_at=time.time(),
         )
         state.trades += 1
         log_signal(signal, "paper_buy", {"price": price})
@@ -457,7 +476,7 @@ async def handle_signal(signal: Signal, exchanges: dict,
         exchange=chosen_ex_name,
         amount=fill_amount, entry=fill_price,
         cost=TRADE_USDT, targets=signal.targets,
-        stop=signal.stop, opened_at=time.time(),
+        stop=effective_stop, opened_at=time.time(),
     )
     state.trades += 1
     log_signal(signal, "live_buy", {
@@ -495,9 +514,14 @@ async def monitor_positions(exchanges: dict, state: State, paper: bool):
                 else:
                     # Partial exit — sell 1/N of remaining
                     portion = pos.amount / (len(pos.targets) - pos.targets_hit + 1)
+                    portion_value = portion * cur
+                    # Skip partial if below exchange minimum notional
+                    if portion_value < MIN_SELL_USDT:
+                        print(f"[skip] partial TP too small ${portion_value:.2f} < ${MIN_SELL_USDT}")
+                        continue
                     pnl = (cur - pos.entry) * portion
                     msg = (f"TP{pos.targets_hit} {pair} @{cur:.6g} "
-                           f"(partial sell {portion:.6g})")
+                           f"(partial sell {portion:.6g} ~${portion_value:.1f})")
                     print(msg)
                     notify(msg, tag="signal")
                     if not paper:
@@ -569,6 +593,12 @@ async def eval_channel(exchanges: dict):
     print(f"Trades entered:        {len(buys)}")
     print(f"Trades exited:         {len(exits)}")
 
+    skipped = [e for e in entries if e.get("action", "").startswith("skip:")]
+    skip_reasons = {}
+    for s in skipped:
+        reason = s.get("action", "skip:?").split(":", 1)[1]
+        skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
     if exits:
         pnls = [e.get("result", {}).get("pnl", 0) for e in exits if e.get("result")]
         wins = sum(1 for p in pnls if p > 0)
@@ -576,6 +606,33 @@ async def eval_channel(exchanges: dict):
         print(f"Win rate:              {wins}/{len(pnls)} = {wins/len(pnls):.1%}")
         print(f"Total PnL:             ${total_pnl:+.2f}")
         print(f"Avg PnL per trade:     ${total_pnl/len(pnls):+.2f}")
+        if wins > 0:
+            avg_win = sum(p for p in pnls if p > 0) / wins
+            avg_loss = sum(p for p in pnls if p <= 0) / max(len(pnls) - wins, 1)
+            print(f"Avg win:               ${avg_win:+.2f}")
+            print(f"Avg loss:              ${avg_loss:+.2f}")
+
+    still_open = len(buys) - len(exits)
+    if still_open > 0:
+        print(f"Still open:            {still_open} (unrealized PnL not counted)")
+
+    if skip_reasons:
+        print(f"\nSkip reasons:")
+        for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
+            print(f"  {reason:30s} {count}")
+
+    verdict = "UNKNOWN"
+    if exits and len(exits) >= 10:
+        wr = wins / len(pnls)
+        if total_pnl > 0 and wr >= 0.50:
+            verdict = "PROMISING — consider small live test"
+        elif total_pnl > 0 and wr < 0.50:
+            verdict = "RISKY — few big wins carry it, could reverse"
+        else:
+            verdict = "UNPROFITABLE — do NOT go live"
+    elif exits:
+        verdict = "TOO FEW TRADES — need 10+ exits to evaluate"
+    print(f"\nVerdict: {verdict}")
     print(f"{'='*50}\n")
 
 
@@ -616,6 +673,7 @@ async def main(paper: bool, login_only: bool = False):
         me = await client.get_me()
         print(f"[login] OK — logged in as {me.first_name} ({me.phone})")
         print(f"[login] session saved to {SESSION}.session")
+        print(f"[login] IMPORTANT: chmod 600 {SESSION}.session")
         await client.disconnect()
         return
 
@@ -628,6 +686,14 @@ async def main(paper: bool, login_only: bool = False):
     if not exchanges:
         print("[err] no exchanges configured")
         return
+
+    # Pre-load markets once at startup (faster signal handling later)
+    for name, ex in exchanges.items():
+        ok = await ensure_markets_loaded(ex)
+        if ok:
+            print(f"[exchange] {name}: {len(ex.markets)} pairs loaded")
+        else:
+            print(f"[exchange] {name}: market load failed — will retry per signal")
 
     # ─── Telethon event handler ───
     @client.on(events.NewMessage(chats=TG_CHANNEL))
