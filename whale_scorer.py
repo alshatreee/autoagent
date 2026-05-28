@@ -34,13 +34,18 @@ Install:  pip install aiohttp
 """
 
 import asyncio
+import csv
 import aiohttp
+import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Optional
 
 DATA_API  = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
+EXPORT_CSV = "whale_scores.csv"
+EXPORT_JSON = "whale_scores.json"
 
 # ═══════════════════════════════════════════════════════
 # CANDIDATES — edit this list
@@ -116,7 +121,7 @@ async def fetch_positions(session, address: str) -> list[dict]:
 
 
 async def fetch_activity(session, address: str) -> list[dict]:
-    """Recent trade activity for a user."""
+    """Recent wallet activity for a user."""
     data = await fetch_json(session, f"{DATA_API}/activity", {
         "user":  address,
         "limit": 500,
@@ -137,7 +142,13 @@ async def fetch_value(session, address: str) -> dict:
 @dataclass
 class WhaleScore:
     address:     str
+    wallet_type: str              = "trader"
     roi:         Optional[float] = None
+    net_cashflow: Optional[float] = None
+    total_buys:  Optional[float] = None
+    total_sells: Optional[float] = None
+    total_redeemed: Optional[float] = None
+    total_rebates: Optional[float] = None
     total_trades: Optional[int]  = None
     win_rate:    Optional[float] = None
     max_dd:      Optional[float] = None
@@ -149,9 +160,30 @@ class WhaleScore:
     recommended: bool            = False
 
 
+def _activity_type(a: dict) -> str:
+    return _s(a, "type", "eventType", "activityType").upper()
+
+
+def _activity_side(a: dict) -> str:
+    return _s(a, "side", "orderSide", "direction").upper()
+
+
+def classify_wallet(activity: list[dict]) -> str:
+    total = len(activity)
+    if not total:
+        return "trader"
+
+    redeem_count = sum(1 for a in activity if _activity_type(a) == "REDEEM")
+    rebate_count = sum(1 for a in activity if _activity_type(a) == "MAKER_REBATE")
+    if redeem_count + rebate_count >= max(1, int(total * 0.2)) or rebate_count >= 3:
+        return "market_maker"
+    return "trader"
+
+
 def score_whale(address: str, positions: list[dict],
                 activity: list[dict], value: dict) -> WhaleScore:
     w = WhaleScore(address=address)
+    w.wallet_type = classify_wallet(activity)
 
     # ── 1. ROI ──
     total_cost, total_value, realized = 0.0, 0.0, 0.0
@@ -166,6 +198,38 @@ def score_whale(address: str, positions: list[dict],
     if total_cost > 0:
         # ROI = (current value + realized pnl - initial cost) / initial cost
         w.roi = (total_value + realized - total_cost) / total_cost
+
+    # Activity-level cashflow tracking for market maker wallets
+    total_buys, total_sells, total_redeemed, total_rebates = 0.0, 0.0, 0.0, 0.0
+    for a in activity:
+        amount = _f(a, "usdcSize", "size", "amount", "value")
+        if amount <= 0:
+            continue
+        kind = _activity_type(a)
+        side = _activity_side(a)
+        if kind == "TRADE":
+            if side in ("SELL", "ASK"):
+                total_sells += amount
+            else:
+                total_buys += amount
+        elif kind == "REDEEM":
+            total_redeemed += amount
+        elif kind == "MAKER_REBATE":
+            total_rebates += amount
+
+    w.total_buys = total_buys if total_buys > 0 else None
+    w.total_sells = total_sells if total_sells > 0 else None
+    w.total_redeemed = total_redeemed if total_redeemed > 0 else None
+    w.total_rebates = total_rebates if total_rebates > 0 else None
+
+    if w.wallet_type == "market_maker":
+        # For MM wallets, ROI is cash-flow based, not position-value based.
+        net_cashflow = total_redeemed + total_rebates + total_sells - total_buys
+        w.net_cashflow = net_cashflow
+        if total_buys > 0:
+            w.roi = net_cashflow / total_buys
+    else:
+        w.net_cashflow = (total_value + realized - total_cost) if total_cost > 0 else None
 
     # ── 2. total trades (distinct markets touched) ──
     markets_seen = {_s(p, "conditionId", "condition_id") for p in positions}
@@ -260,13 +324,79 @@ def fmt(v, pattern, na="N/A"):
     return pattern.format(v) if v is not None else na
 
 
+def short_addr(addr: str) -> str:
+    if len(addr) <= 12:
+        return addr
+    return f"{addr[:8]}…{addr[-4:]}"
+
+
+def export_scores(scores: list[WhaleScore]) -> None:
+    rows = []
+    for s in scores:
+        row = asdict(s)
+        row["criteria"] = json.dumps(s.criteria, ensure_ascii=False, sort_keys=True)
+        rows.append(row)
+
+    json_path = Path(EXPORT_JSON)
+    csv_path = Path(EXPORT_CSV)
+
+    json_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if rows:
+        fieldnames = list(rows[0].keys())
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def print_summary_table(scores: list[WhaleScore]) -> None:
+    if not scores:
+        return
+
+    columns = [
+        ("Address", lambda s: short_addr(s.address)),
+        ("Type", lambda s: "MM" if s.wallet_type == "market_maker" else "TR"),
+        ("Score", lambda s: f"{s.score}/7"),
+        ("ROI", lambda s: fmt(s.roi, "{:+.1%}")),
+        ("Net Cash", lambda s: fmt(s.net_cashflow, "${:+,.0f}")),
+        ("Redeemed", lambda s: fmt(s.total_redeemed, "${:,.0f}")),
+        ("Rebates", lambda s: fmt(s.total_rebates, "${:,.0f}")),
+        ("Trades", lambda s: fmt(s.total_trades, "{}")),
+        ("Win%", lambda s: fmt(s.win_rate, "{:.1%}")),
+        ("DD", lambda s: fmt(s.max_dd, "{:.1%}")),
+        ("Cats", lambda s: fmt(s.categories, "{}")),
+        ("Recent", lambda s: fmt(s.last_trade_age_days, "{:.1f}d")),
+        ("Size", lambda s: fmt(s.median_size, "${:,.0f}")),
+        ("Rec", lambda s: "YES" if s.recommended else "NO"),
+    ]
+
+    rows = [[getter(s) for _, getter in columns] for s in scores]
+    widths = []
+    for idx, (label, _) in enumerate(columns):
+        widths.append(max(len(label), max(len(row[idx]) for row in rows)))
+
+    def line() -> None:
+        print("  " + "  ".join("-" * w for w in widths))
+
+    print("\n  SCORE TABLE")
+    print("  " + "  ".join(label.ljust(widths[i]) for i, (label, _) in enumerate(columns)))
+    line()
+    for row in rows:
+        print("  " + "  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+
+
 def print_scorecard(w: WhaleScore):
     mark = "RECOMMEND" if w.recommended else "REJECT   "
     print(f"\n{'='*60}")
     print(f"  {mark}  {w.address}")
+    print(f"  mode:      {'MM' if w.wallet_type == 'market_maker' else 'TR'}")
     print(f"  score: {w.score}/7")
     print(f"{'-'*60}")
     print(f"  ROI:         {fmt(w.roi, '{:+.1%}'):>10}  (need >= {MIN_ROI:.0%})")
+    print(f"  Net cash:    {fmt(w.net_cashflow, '${:+,.0f}'):>10}")
+    print(f"  Redeemed:    {fmt(w.total_redeemed, '${:,.0f}'):>10}")
+    print(f"  Rebates:     {fmt(w.total_rebates, '${:,.0f}'):>10}")
     print(f"  Trades:      {fmt(w.total_trades, '{}'):>10}  (need >= {MIN_TRADES})")
     print(f"  Win rate:    {fmt(w.win_rate, '{:.1%}'):>10}  (need >= {MIN_WIN_RATE:.0%})")
     print(f"  Max DD:      {fmt(w.max_dd, '{:.1%}'):>10}  (need <= {MAX_DRAWDOWN:.0%})")
@@ -315,6 +445,7 @@ async def main():
             await asyncio.sleep(1)
 
     scores.sort(key=lambda s: s.score, reverse=True)
+    export_scores(scores)
 
     print("\n" + "#" * 60)
     print("  SUMMARY")
@@ -325,10 +456,13 @@ async def main():
     if recommended:
         print("  Copy these into polymarket_bot.py WHALES list:\n")
         for s in recommended:
-            print(f'      "{s.address}",  # score {s.score}/7')
+            print(f'      "{s.address}",  # {s.wallet_type[:2].upper()} score {s.score}/7')
     else:
         print("  No candidates passed. Find better whales before going live.")
     print()
+
+    print_summary_table(scores)
+    print(f"\n  Exported: {EXPORT_JSON}, {EXPORT_CSV}")
 
 
 if __name__ == "__main__":
